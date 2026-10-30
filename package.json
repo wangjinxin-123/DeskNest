@@ -1,0 +1,38 @@
+{
+  "name": "desknest",
+  "productName": "DeskNest",
+  "version": "1.0.0",
+  "description": "桌面图标收纳 + 美化工具：手机式文件夹管理 Windows 桌面图标，极轻量常驻。",
+  "main": "main.js",
+  "author": "you",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "start:lite": "electron . --disable-gpu",
+    "check": "node --check main.js && node --check preload.js && node --check src/renderer.js && node --check src/catalog.js",
+    "icon": "node tools/make-icon.js",
+    "shot": "node tools/shot-v4.js",
+    "shot:legacy": "node tools/shot.js",
+    "front": "node tools/front-probe.mjs raise",
+    "dist": "electron-builder --win --x64 --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  },
+  "build": {
+    "appId": "com.local.desknest",
+    "icon": "assets/desknest.ico",
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "assets/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    }
+  }
+}

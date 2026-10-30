@@ -1,0 +1,11 @@
+﻿const l = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+const p = l.find(t => t.type === 'page');
+console.log('targets:', l.map(t=>t.type+':'+t.url).join(' | '));
+const ws = new WebSocket(p.webSocketDebuggerUrl);
+let i=0; const q=new Map();
+await new Promise(r=>{ws.onopen=r;});
+ws.onmessage=e=>{const m=JSON.parse(e.data); if(m.id&&q.has(m.id)){q.get(m.id)(m.result);q.delete(m.id);}};
+const send=(me,pa={})=>new Promise(r=>{const id=++i;q.set(id,r);ws.send(JSON.stringify({id,method:me,params:pa}));});
+const ev=async x=>(await send('Runtime.evaluate',{expression:x,returnByValue:true,awaitPromise:true})).result.value;
+console.log(JSON.stringify(await ev(`({vis:document.visibilityState, focus:document.hasFocus(), iw:innerWidth, ih:innerHeight, sx:screenX, sy:screenY, ow:outerWidth, oh:outerHeight, chip:!document.getElementById('chip').hidden, name:document.getElementById('chipName').textContent})`)));
+ws.close(); process.exit(0);

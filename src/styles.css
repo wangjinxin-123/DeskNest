@@ -1,0 +1,1061 @@
+﻿/* ============================================================================
+   DeskNest · 视觉系统 v3（Light Frosted Glass / 手机文件夹 + 分页桌面）
+   ----------------------------------------------------------------------------
+   美术原则
+     1. 毛玻璃 = 系统 acrylic 打底 + 「白色提亮层 + 顶部内高光 + 1px 冷色描边」三件套
+     2. 白不是死白：所有白色都带一点蓝（#fff → rgba(255,255,255,.5)）压在冷灰底上
+     3. 阴影分两层：近距离实影（0 2px 8px）+ 远距离扩散影（0 18px 44px），单层一定显平
+     4. 图标永远站在自己的白色小托盘上，颜色由图标像素取色（--tint）做柔和外发光
+     5. 动效只动 transform / opacity；模糊只用在小的浮层（设置面板/右键菜单/Toast）
+   ============================================================================ */
+:root {
+  /* 表面 */
+  --w-1: rgba(255, 255, 255, 0.78);
+  --w-2: rgba(255, 255, 255, 0.58);
+  --w-3: rgba(255, 255, 255, 0.38);
+  --w-4: rgba(255, 255, 255, 0.20);
+  --frost: rgba(246, 249, 255, 0.62);
+  /* 描边 */
+  --edge: rgba(118, 142, 184, 0.20);
+  --edge-2: rgba(118, 142, 184, 0.12);
+  --hi: rgba(255, 255, 255, 0.92);
+  /* 文字 */
+  --ink: #3B3F52;
+  --ink-2: #4e5c78;
+  --ink-3: #8390a8;
+  /* 品牌 */
+  --accent: #2f7cff;
+  --accent-2: #22c6ff;
+  --accent-soft: rgba(47, 124, 255, 0.12);
+  --danger: #ff5d73;
+  /* 阴影 */
+  --sh-1: 0 2px 8px rgba(24, 40, 76, 0.10);
+  --sh-2: 0 18px 44px rgba(24, 40, 76, 0.16);
+  --sh-3: 0 26px 70px rgba(24, 40, 76, 0.22);
+  /* 动效 */
+  --ease: cubic-bezier(.22, .61, .36, 1);
+  --spring: cubic-bezier(.16, 1.02, .36, 1);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", "微软雅黑", system-ui, sans-serif;
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------------ 外壳
+   窗口比面板大 WINDOW_PAD(20px) 一圈：那圈是透明的，专门用来渲染投影，
+   所以玻璃面板看上去是"浮在桌面上"的，而不是贴边的方块。 */
+/* 默认（收起态）= 只有一颗球：面板本身必须"什么都不画"。
+   面板样式改成挂在 body.expanded 上（白名单），而不是给收起态打补丁 ——
+   这样任何状态异常都不会再出现"白圆角矩形套着球"。 */
+.app {
+  position: absolute; inset: 20px;
+  border-radius: 50%;
+  overflow: visible;
+  isolation: isolate;
+}
+body.expanded .app {
+  border-radius: 20px;
+  overflow: hidden;
+  /* 只保留内侧顶部高光。外投影（0 20px 60px）会在卡片外围那圈透明 pad 里
+     画出一条灰色阴影带，看起来像卡片后面还压着一层东西，且随窗口长宽一起拉伸 —— 已移除。
+     高光要跟着透明度滑块淡出，否则 0% 时卡片边缘还留着一条白线。 */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, calc(0.9 * var(--glass-opacity, 1)));
+}
+/* 真·毛玻璃底图（唯一能拿到「卡片后面那一帧桌面」的办法）：
+   窗口是 transparent:true 的独立层，桌面根本不在页面里 → .glass 上的 backdrop-filter 摸不到它，
+   Chromium 没东西可模糊，只能渲成一整块白雾。这就是「白膜浓度从 0.55 调到 0.34 还是白板」的真正原因：
+   问题不在白膜，在于玻璃背后压根没有像素。
+   所以主进程在窗口 show() 之前用一次 CopyFromScreen 抓一帧桌面（缩到 240×150，几 KB），
+   这里按「桌面坐标」把它贴在卡片下层：background-size = 整块屏幕，background-position = 负的窗口屏幕坐标，
+   卡片显示的就是它正下方那片壁纸，窗口怎么挪都对得上。
+   然后 .glass 再对「这一层」做 backdrop-filter —— 这次背后真有像素了，模糊才成立。 */
+.frost {
+  position: absolute; inset: 0;
+  z-index: 0;
+  display: none;
+  pointer-events: none;
+  border-radius: 20px;
+  overflow: hidden;
+  background-image: var(--backdrop, none);
+  /* 每一帧抓的就是「卡片正下方那块屏幕」的缩小版，所以 1:1 铺满即可，不再需要屏幕坐标对齐 */
+  background-size: 100% 100%;
+  background-position: 0 0;
+  background-repeat: no-repeat;
+  /* 磨砂白的关键在这里：底图只贡献明暗，不贡献颜色。
+     grayscale 把背后任何颜色（哪怕是纯绿窗口）压成灰，所以背后是什么色都不会把卡片染色；
+     blur 再糊一次，160×104 的底图彻底化开成一片雾 —— 玻璃里看到的是「背后东西的形状」。
+     滤镜顺序很关键：contrast 必须写在 brightness 前面。滤镜从左到右逐条执行，
+     先 brightness(3) 会把中高亮度直接裁剪成纯白，紧接着的 contrast(0.2) 又把纯白拉回 0.6 灰，
+     整卡就成了一层提不亮的均匀灰白（实测中心亮度卡死在 239）。先压对比再提亮才对：
+     暗部 0.42 → 基础白度约 232；中灰 0.70 → 242；亮部 0.88 → 248。 */
+  filter: grayscale(1) contrast(0.4) brightness(1.4) blur(18px);
+  transform: scale(1.1);    /* 放大一点：blur 会吸到边缘透明，不放大卡片四周会发虚 */
+  /* 这一层必须跟透明度滑块一起淡出 —— 它就是「0% 时卡片还剩一层灰雾」的元凶：
+     玻璃白膜已经透明了，但这层去色抓屏底图仍然是 100% 不透明地铺在卡片里。 */
+  opacity: var(--glass-opacity, 1);
+}
+body.has-backdrop.expanded .frost { display: block; }
+/* 有真背景了，那套「网格 + 巨号页码 + 光斑」的替身背景就该退场 ——
+   它们叠在玻璃下面会把背景颜色洗成蓝灰色，正是「卡片不是背景色」的来源。
+   只有用户自己选了壁纸图时才保留（那张图才是他想要的背景）。 */
+body.has-backdrop:not(.has-cardbg) .cardbg,
+body.has-backdrop:not(.has-cardbg) .cardbg-grid,
+body.has-backdrop:not(.has-cardbg) .cardbg-num,
+body.has-backdrop:not(.has-cardbg) .cardbg-blob { display: none !important; }
+/* 原生 Acrylic 激活时：系统接管毛玻璃，不再需要截图虚化和白色玻璃覆盖 */
+body.has-acrylic .frost,
+body.has-acrylic .glass { display: none !important; }
+/* 窗口形变那 200~300ms：关掉大面积重绘项（SVG 湍流颗粒 + backdrop-filter），
+   但保留 .frost（现在只有 blur(5px)，足够便宜，关了反而会一闪一闪）。
+   同时关掉 CSS 过渡，让面板圆角/尺寸变化完全跟着主进程的 setBounds 节拍走，互不打架。 */
+body.morphing .glass::before,
+body.morphing .glass::after { display: none !important; }   /* 湍流是唯一真正重的 */
+body.morphing .glass,
+body.morphing .sheet,
+body.morphing .ctx,
+body.morphing .toast,
+body.morphing .dlg {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: none !important;
+}
+/* 面板本身那圈大范围外投影（24px 模糊）在每次改宽高时都要整圈重画，而且无法缓存；
+   形变期间一并关掉，松手自动恢复 */
+body.morphing .app { box-shadow: none !important; }
+body.morphing .app,
+body.morphing .app * { transition: none !important; }       /* setBounds 已经逐帧画了，CSS 过渡会跟它打架 */
+/* 宽度拖动 = 网格每改一次宽就整页重新换行／每个图标横向挪一次，这是掉帧的主因（实测布局耗时是调高度的 3 倍）。
+   形变期间把当前列数和列宽锁死，图标原地不动，只让面板宽度跟着窗口走；松手后一次性按新宽度重排。 */
+body.morphing .page {
+  grid-template-columns: repeat(var(--pin-cols, 12), var(--pin-track, 96px));
+}
+/* 图标投影滤镜会逼 Chromium 逐个重绘图标，形变期间先关掉 */
+body.morphing .item .tile img { filter: none !important; }
+html.simple .frost { filter: grayscale(1) blur(20px); }
+
+/* ------------------------------------------------------------ 卡片背景层
+   毛玻璃的前提：卡片背后必须有「真实存在于页面内」的颜色与形状可被模糊。
+   Windows 透明窗口下 backdrop-filter 摸不到桌面，所以这一层不是装饰，是替身背景：
+   它真实铺在 .glass 之下（z-index:0 + DOM 顺序在前），.glass 再对它做 blur(28px)，
+   于是巨号数字的笔画和网格线被柔化成色块。
+   整层严格等于卡片矩形（inset:0 + 20px 圆角），不会在圆角外露出方形亮块。 */
+.cardbg {
+  position: absolute; inset: 0; z-index: 0;
+  display: none;
+  border-radius: 20px;
+  overflow: hidden;
+  pointer-events: none;
+  /* 不再铺 #eef1f7 实色底：那一层不透明，滑块拉到 100% 时会把桌面完全挡死，
+     看上去就是一块纯白板。现在底子透明，只留毛玻璃自己的白雾（见 .glass），
+     桌面颜色就能像真玻璃一样透上来 —— 这才是「玻璃会反映后面背景色」。
+     网格/巨号数字/光斑仍然在这层里，跟着滑块一起淡入淡出。 */
+  background: transparent;
+  opacity: var(--glass-opacity, 1);
+}
+body.expanded .cardbg { display: block; }
+/* 固定白色玻璃不需要「替身背景」了：细网格 / 巨号页码 / 光斑原本是给 backdrop-filter 提供
+   可模糊的像素，现在卡片不再模糊底图，它们只会变成白面上几块莫名其妙的浅色残影 —— 全部撤掉。 */
+.cardbg-grid, .cardbg-num, .cardbg-blob { display: none !important; }
+body.has-acrylic .cardbg { display: none !important; }   /* 系统 acrylic 接管毛玻璃时不再叠假背景 */
+
+/* 1. 可选壁纸图片：Wallpaper Engine 壁纸预览图 / 用户自己上传的图片
+   cover（铺满）：宽高等比放大到把整张卡片填满，一点空档都不留 ——
+   卡片里看到的永远是壁纸本体，不再出现左右两片磨砂空档。
+   代价是比例和卡片不一致时（竖图/方图）会裁掉一部分：这里认的是「整卡都是壁纸」，
+   裁切交给背景的居中定位，卡片改长宽时也自动跟着重新铺。 */
+.cardbg-img {
+  position: absolute; inset: 0;
+  display: none;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+body.has-cardbg .cardbg-img { display: block; }
+/* 动态壁纸（视频）：
+   直接用壁纸本体 mp4/webm，`object-fit: cover` 按卡片的宽高比裁切 —— 这就是「用合适的
+   长宽去截视频」：卡片多大，画面就按多大铺满，不放大低分辨率预览图，也没有糊的风险。
+   默认不显示，只有主进程确认这张壁纸带视频（body.has-cardvideo）时才上。 */
+.cardbg-video {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  object-position: center;
+  display: none;
+  pointer-events: none;
+}
+body.has-cardbg.has-cardvideo .cardbg-video { display: block; }
+/* 壁纸态必须把桌面抓屏底图（.frost）撤掉：
+   它在 DOM 里排在 .cardbg 之后、两者都是 z-index:0，会整块盖在壁纸上面，
+   表现就是「选了壁纸却看不见壁纸，卡片还是那层桌面灰雾」。
+   壁纸本身就是卡片背景，不再需要桌面替身。
+   必须 !important：`body.has-backdrop.expanded .frost { display: block }` 的权重比这条高，
+   不加就被它盖回 block，壁纸又看不见了。 */
+body.has-cardbg .frost { display: none !important; }
+
+/* 2. 网格线：62px 细网格 + 每 3 格一条 186px 主网格 */
+/* blur(28px)（sigma=14）是一台「低通滤波器」：周期 T 的图案衰减 exp(-2π²σ²/T²)，
+   62px 周期衰减到只剩 18%（实测整卡被平均成一片平色，网格完全看不见），
+   186px 周期还能留下 89%。
+   所以这里分两种线：62px 的 1px 细线（规范要求的「细网格线」本体，负责不模糊时的细节），
+   以及 186px 的 56px 宽带（每 3 格一条主网格，专职在玻璃下留下柔化色块）。
+   两者同左边缘、186 = 3×62 正好对齐，看上去就是「细网格 + 每三格一条主线」。
+   主网格的浓度要明显低于巨号数字：两者都是深蓝，若一样浓，数字就融进网格里看不见了。 */
+.cardbg-grid {
+  position: absolute; inset: 0;
+  background-image:
+    linear-gradient(to right, rgba(58, 92, 150, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(58, 92, 150, 0.03) 1px, transparent 1px),
+    linear-gradient(to right, rgba(58, 92, 150, 0.07) 56px, transparent 56px),
+    linear-gradient(to bottom, rgba(58, 92, 150, 0.07) 56px, transparent 56px);
+  background-size: 62px 62px, 62px 62px, 186px 186px, 186px 186px;
+}
+body.has-cardbg .cardbg-grid { opacity: .45; }
+
+/* 3. 巨号深蓝页码（当前页 / 总页数）：右下角出血，被卡片边缘裁掉一部分 */
+.cardbg-num {
+  /* 字号与浓度必须给足：blur(28px) 是低通滤波，笔画越细衰减越狠。
+     188px 的笔画只有 26px 宽，blur 后只剩约 1/5 对比，被玻璃的 0.55 白再压到 45%，
+     实测整块近乎隐形；放大到 66vh（约 327px、笔画 ~46px）并把 alpha 打满，
+     才能留下「笔画被柔化成的深蓝色块」（实测平均压暗约 10 个亮度级、峰值 40+）。
+     bottom 只用很小的负值：更大的负值会把整行推到卡片外，只剩笔画顶端露出来。 */
+  position: absolute; right: -0.02em; bottom: -0.06em;
+  font-size: min(66vh, 46vw);
+  font-weight: 800; line-height: .8; letter-spacing: -0.03em;
+  color: rgba(16, 44, 108, 0.12);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.cardbg-num span { color: rgba(16, 44, 108, 0.10); }
+/* 有壁纸时数字仍是深蓝（规范：巨大的深蓝数字），但不能像默认态那样压满：
+   壁纸本身已经提供了形状与颜色，数字再以满浓度糊上去会把照片盖成一片深蓝。
+   收到 55% 后是「一眼能看到的深蓝水印」，同时照片仍然读得出来。 */
+body.has-cardbg .cardbg-num { color: rgba(12, 36, 92, 0.55); }
+body.has-cardbg .cardbg-num span { color: rgba(12, 36, 92, 0.45); }
+
+/* 4. 三个大面积柔光斑：淡蓝 / 冷白 / 淡紫，120px 高斯模糊，分散在卡片四角 */
+.cardbg-blob {
+  position: absolute;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+  filter: blur(120px);
+  pointer-events: none;
+}
+.cardbg-blob.b1 {
+  left: -18%; top: -28%; width: min(660px, 86%);
+  background: radial-gradient(closest-side, #7EA8FF, rgba(126, 168, 255, 0) 74%);
+  opacity: .06;
+}
+.cardbg-blob.b2 {
+  right: -14%; top: -20%; width: min(560px, 74%);
+  background: radial-gradient(closest-side, #B8B4FF, rgba(184, 180, 255, 0) 74%);
+  opacity: .05;
+}
+.cardbg-blob.b3 {
+  left: -14%; bottom: -32%; width: min(620px, 80%);
+  background: radial-gradient(closest-side, #FFFFFF, rgba(255, 255, 255, 0) 72%);
+  opacity: .06;
+}
+/* 有壁纸时：照片必须清晰可读 —— 只留一层极淡的白雾，绝不再做 blur(28px)
+   （28px 会把整张壁纸糊成一片色团，等于看不见图）；
+   网格与柔光斑也一并收掉，否则会把照片洗白、显脏；
+   壁纸这一层也不跟透明度滑块衰减 —— 那张图就是背景本身，淡到 30% 会整片发白。 */
+/* 壁纸态反过来：图片就是背景本身，下面要垫一层浅色底，
+   否则 contain 留出的左右/上下空档会直接透出桌面，图就像浮在半空的一张画。 */
+body.has-cardbg .cardbg { opacity: 1; background: #eef1f7; }
+body.has-cardbg .cardbg-grid { opacity: 0; }
+body.has-cardbg .cardbg-blob { opacity: 0; }
+body.has-cardbg .glass {
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: saturate(115%) brightness(1.02);
+  -webkit-backdrop-filter: saturate(115%) brightness(1.02);
+}
+/* 壁纸态不叠巨号页码水印：照片本身就是背景，压一层大字只会盖住画面 */
+body.has-cardbg .cardbg-num { opacity: 0; }
+/* 窗口形变期间绝不能用 filter:none —— 那会把三个 120px 高斯模糊的大光斑
+   瞬间变成三道硬边彩色圆，拖动时就是一下一下的"闪屏"（宽度拖动尤其明显）。
+   改成：临时隐藏光斑，由 .cardbg 自己的一层等价的静态径向渐变顶上，
+   视觉上几乎一样，但尺寸变化时零重算。 */
+body.morphing .cardbg-blob { visibility: hidden; }
+body.morphing .cardbg {
+  background-image:
+    radial-gradient(38% 46% at 6% 2%, rgba(126, 168, 255, 0.06), rgba(126, 168, 255, 0) 74%),
+    radial-gradient(32% 40% at 94% 4%, rgba(184, 180, 255, 0.05), rgba(184, 180, 255, 0) 74%),
+    radial-gradient(34% 44% at 8% 96%, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0) 72%);
+}
+body.has-cardbg.morphing .cardbg { background-image: none; }
+
+/* -------------------------------------------------- 玻璃材质（严格按规范数值）
+   rgba(255,255,255,.55) + blur(28px) saturate(180%) brightness(1.05) + 1px 亮边。
+   透明度滑块调的是玻璃自己的 alpha，而不是 opacity —— 用 opacity 会把里面的
+   文字和图标一起变淡（第五节明令禁止）。 */
+.glass {
+  position: absolute; inset: 0; pointer-events: none;
+  border-radius: 20px;
+  overflow: hidden;
+  /* 磨砂白（定稿）：0.86 的白雾压在上面那层「已去色、已糊透」的底图上。
+     白太少（<0.6）会露出底图的灰，看着脏；白太多（>0.9）又变回一白白板，
+     形状完全透不上来。左上一团柔光 + 顶部一道亮边，让雾面有受光方向，不是一块死平的色。
+     透明度滑块统一走整层的 opacity（而不是把每个 alpha 都乘一遍）：
+     opacity 是线性淡出，0% 时连 1px 边框和内侧高光一起消失，才是真·完全透明。 */
+  opacity: var(--glass-opacity, 1);
+  background-color: rgba(252, 253, 255, 0.86);
+  background-image:
+    radial-gradient(60% 48% at 26% 14%, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0) 70%),
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.4) 0%,
+      rgba(255, 255, 255, 0) 36%);
+  /* 对下面那层「已去色的底图」再糊一次：底图本身是放大的，这一道 blur 负责把 JPEG 颗粒也抹平，
+     出来的才是磨砂玻璃那种均匀的漫反射雾面，而不是一层薄塑料膜。 */
+  backdrop-filter: blur(18px) saturate(100%);
+  -webkit-backdrop-filter: blur(18px) saturate(100%);
+  border: var(--glass-w, 1px) solid var(--glass-border, rgba(255, 255, 255, 0.75));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+/* 磨砂颗粒（真正的「磨砂」就靠它）：
+   之前用的是 mix-blend-mode: overlay —— overlay 在纯白底上恒等于白，等于什么都没画，
+   所以白面永远是一块死平板。现在改成两张离线生成好的纹理直接叠上去（assets/frost-*.png）：
+     frost-grain.png 高频浅灰麻点，alpha 0..0.34 —— 近看是哑光砂面；
+     frost-cloud.png 16×16 随机点双三次放大到 512 的雾团，暗处才有 alpha —— 白面「厚薄不均」。
+   两张都是纯灰无彩度，且只在 alpha 上做文章，不会给白面染任何颜色；
+   background-size 取 317px（不是 256 的整数倍）是为了让平铺接缝错开，看不出重复。 */
+.glass::before {
+  content: ""; position: absolute; inset: var(--glass-w, 0px);
+  opacity: .72;
+  background-image: url("../assets/frost-grain.png");
+  background-size: 317px 317px;
+}
+.glass::after {   /* 低频雾气团：只让白面有「厚薄不均」的层次，不引入任何图案 */
+  content: ""; position: absolute; inset: var(--glass-w, 0px);
+  opacity: .7;
+  background-image: url("../assets/frost-cloud.png");
+  background-size: 512px 512px;
+}
+body.has-cardbg .glass::before,
+body.has-cardbg .glass::after { display: none; }   /* 壁纸态别把照片搓出麻点 */
+
+/* 收起态：面板本身透明，只有那颗圆钮 + 它的圆形投影（别再叠一层方形玻璃底） */
+body.collapsed .app { border-radius: 50%; box-shadow: none; overflow: visible; }
+body.collapsed .glass { display: none; }
+/* 只有展开态才画玻璃底（透明由 background 的 alpha 控制，不用 opacity） */
+.glass { display: none; }
+body.expanded .glass { display: block; }
+
+/* ================================================= 收起态：桌面上一颗白色圆钮 */
+.chip {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  -webkit-app-region: drag;               /* 圆钮外面那一圈透明区域 = 拖动把手 */
+}
+.chip[hidden] { display: none; }
+
+.chip-btn {
+  -webkit-app-region: no-drag;
+  position: relative;
+  width: 54px; height: 54px;
+  display: grid; place-items: center;
+  border: 0; padding: 0; border-radius: 50%;
+  overflow: hidden;
+  cursor: pointer;
+  /* 白色毛玻璃球：白雾厚一点 + 毛玻璃只留一点点透明感（背景图被压进 54px 会显脏，所以压到 0.38） */
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.99) 0%, rgba(255, 255, 255, 0.93) 52%, rgba(252, 253, 255, 0.90) 100%);
+  border: 0;
+  outline: 1px solid rgba(255, 255, 255, 0.75);
+  box-shadow:
+    inset 0 1px 0 #fff,
+    inset 0 -6px 12px rgba(120, 142, 184, 0.16),
+    inset 0 0 0 1px rgba(118, 142, 184, 0.16),
+    0 2px 5px rgba(24, 40, 76, 0.14),
+    0 10px 24px rgba(24, 40, 76, 0.22);
+  transition: transform .26s var(--spring), box-shadow .26s var(--ease), background .2s var(--ease);
+}
+/* 圆钮里的真·毛玻璃：同一张桌面缩略图，圆形裁切 + 模糊 */
+.chip-btn::before {
+  content: ""; position: absolute; inset: -14%;
+  background-image: var(--backdrop, none);
+  background-size: cover; background-position: center;
+  filter: blur(14px) saturate(1.35) brightness(1.62);
+  clip-path: circle(50% at 50% 50%);
+  opacity: 0;
+  transition: opacity .28s var(--ease);
+  pointer-events: none;
+}
+/* 球里不放背景图：整屏缩略图压进 54px 会让球的颜色跟着"屏幕中心"变（深色壁纸下球就发黑）。
+   纯白半透明球在任何壁纸下都是白的、都好看 —— 这才是"毛玻璃半透明白球"。 */
+body.has-backdrop .chip-btn::before { opacity: 0; }
+/* 上半个球面高光：圆形玻璃的"厚度感"来源 */
+.chip-btn::after {
+  content: ""; position: absolute; left: 9%; right: 9%; top: 6%; height: 46%;
+  border-radius: 50%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0));
+  pointer-events: none;
+}
+.chip-btn svg {
+  position: relative;
+  width: 21px; height: 21px;
+  fill: none; stroke: #101319; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round;
+  transition: transform .3s var(--spring), stroke .2s var(--ease);
+}
+.chip-btn:hover {
+  transform: translateY(-3px) scale(1.05);
+  box-shadow:
+    inset 0 1px 0 #fff,
+    inset 0 -8px 14px rgba(120, 142, 184, 0.18),
+    inset 0 0 0 1px rgba(118, 142, 184, 0.2),
+    0 4px 10px rgba(24, 40, 76, 0.16),
+    0 20px 44px rgba(24, 40, 76, 0.3),
+    0 0 26px rgba(47, 124, 255, 0.22);
+}
+.chip-btn:hover svg { stroke: #000; transform: translateY(-2px); }
+.chip-btn:active { transform: translateY(0) scale(.94); }
+.chip-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+/* 只在"桌面露出来"的时候才现身：有软件盖住我们时 Chromium 报告 visibilityState=hidden，
+   于是整颗圆钮淡出并把拖动区让出去 —— 事件驱动，零轮询、零定时器。 */
+.chip { transition: opacity .5s var(--ease); }
+body.asleep .chip { opacity: 0; pointer-events: none; -webkit-app-region: no-drag; }
+body.asleep .chip-btn { -webkit-app-region: no-drag; }
+
+/* ===================================================== 展开态：主界面 */
+.main { position: absolute; inset: 0; display: flex; flex-direction: column; }
+.main[hidden] { display: none; }
+
+/* 窗口缩放热区：贴着面板四边四角的透明细条，只负责拖拽改尺寸（不挡内容点击） */
+.rh { position: absolute; z-index: 12; -webkit-app-region: no-drag; }
+.rh-t, .rh-b { left: 14px; right: 14px; height: 7px; }
+.rh-l, .rh-r { top: 14px; bottom: 14px; width: 7px; }
+.rh-t { top: 0; cursor: n-resize; }
+.rh-b { bottom: 0; cursor: s-resize; }
+.rh-l { left: 0; cursor: w-resize; }
+.rh-r { right: 0; cursor: e-resize; }
+.rh-tl, .rh-tr, .rh-bl, .rh-br { width: 16px; height: 16px; }
+.rh-tl { top: 0; left: 0; cursor: nw-resize; }
+.rh-tr { top: 0; right: 0; cursor: ne-resize; }
+.rh-bl { bottom: 0; left: 0; cursor: sw-resize; }
+.rh-br { bottom: 0; right: 0; cursor: se-resize; }
+
+/* 顶栏 */
+.bar {
+  position: relative; z-index: 6;
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px 12px 18px;
+  -webkit-app-region: drag;
+  /* 顶栏保持透明不加底色：只留一条白色分隔线 */
+  border-bottom: 1px solid rgba(255, 255, 255, 0.45);
+}
+.bar::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.9), transparent);
+}
+.title-wrap { -webkit-app-region: drag; flex: 1 1 auto; min-width: 0; }
+.page-name {
+  display: none;
+}
+.page-name-label {
+  font-size: 13px; font-weight: 600; color: var(--t); letter-spacing: 0.3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 当前页配色只用在色盘上，顶栏不再画彩色下边线 */
+/* 背景透明度滑块 */
+  width: 100%; border: 0; outline: 0; background: none;
+  font: inherit; font-size: 17px; font-weight: 700; color: var(--ink);
+  padding: 2px 6px; border-radius: 8px;
+  transition: background .16s var(--ease), box-shadow .16s var(--ease);
+}
+.page-name:hover { background: var(--w-3); }
+.page-name:focus { background: var(--w-1); box-shadow: 0 0 0 2px var(--accent-soft); }
+.page-meta { padding-left: 6px; font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+.bar-right { -webkit-app-region: no-drag; display: flex; align-items: center; gap: 8px; }
+
+.ibtn {
+  -webkit-app-region: no-drag;      /* 顶栏是拖动区，按钮必须显式退出拖动区，否则点击被吞 */
+  width: 34px; height: 34px; flex: 0 0 auto;
+  display: grid; place-items: center;
+  border: 1px solid transparent; border-radius: 50%;
+  background: transparent;              /* 顶栏透明：齿轮自己不加底色 */
+  box-shadow: none;
+  cursor: pointer;
+  transition: transform .18s var(--spring), background .18s var(--ease), box-shadow .18s var(--ease);
+}
+.ibtn svg { width: 17px; height: 17px; fill: none; stroke: var(--ink-2); stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.ibtn:hover { background: rgba(255, 255, 255, 0.6); border-color: rgba(255, 255, 255, 0.75); transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 8px 20px rgba(24, 40, 76, 0.12); }
+.ibtn:hover svg { stroke: var(--ink); }
+.ibtn:active { transform: scale(.94); }
+
+.search {
+  display: flex; align-items: center; gap: 7px;
+  width: 210px; height: 34px; padding: 0 12px;
+  /* 和旁边的齿轮一样：常态完全透明，鼠标悬浮（或正在输入）才亮起那层「更亮的玻璃」。
+     0.6 白 + blur(12px) + 1px 白边，保证输入的文字锐利、不被下面 28px 的大模糊拖花 */
+  border: 1px solid transparent; border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  transition: width .26s var(--ease), background .18s var(--ease),
+              border-color .18s var(--ease), box-shadow .18s var(--ease);
+}
+.search:hover,
+.search:focus-within {
+  background: rgba(255, 255, 255, 0.6);
+  border-color: rgba(255, 255, 255, 0.75);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), var(--sh-1);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+}
+.search:hover svg,
+.search:focus-within svg { stroke: var(--ink-2); }
+.search:hover input::placeholder,
+.search:focus-within input::placeholder { color: var(--ink-2); }
+.search:focus-within { width: 250px; background: rgba(255, 255, 255, 0.8); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), 0 8px 22px rgba(24, 40, 76, 0.16); }
+.search svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: var(--ink-3); stroke-width: 2; stroke-linecap: round; }
+.search input {
+  flex: 1 1 auto; min-width: 0; border: 0; outline: 0; background: none;
+  font: inherit; font-size: 12.5px; color: var(--ink);
+}
+.search input::placeholder { color: var(--ink-3); }
+
+/* 舞台 + 分页 */
+.stage { position: relative; z-index: 2; flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.pages {
+  display: flex; height: 100%;
+  transition: transform .42s var(--spring);
+  will-change: transform;
+}
+.page {
+  flex: 0 0 100%; width: 100%; height: 100%;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 20px 30px 16px;
+  align-content: start;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 18px 12px;
+}
+.page::-webkit-scrollbar { width: 8px; }
+.page::-webkit-scrollbar-thumb { background: rgba(118, 142, 184, 0.26); border-radius: 99px; }
+.page::-webkit-scrollbar-thumb:hover { background: rgba(118, 142, 184, 0.42); }
+
+/* 应用磁贴：白色托盘 + 图标 + 两行名 */
+.item {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 10px 4px 8px;
+  border-radius: 16px;
+  cursor: pointer;
+  transition: transform .2s var(--spring), background .2s var(--ease), box-shadow .2s var(--ease);
+}
+.item:hover { transform: translateY(-3px); background: var(--w-3); box-shadow: 0 12px 26px rgba(24, 40, 76, 0.12); }
+.item:active { transform: scale(.97); }
+.item.dragging { opacity: .4; }
+.item .tile {
+  position: relative;
+  width: 62px; height: 62px;
+  display: grid; place-items: center;
+  /* 不要白色托盘：图标本身就是一块完整图形（多数 256×256 自带圆角），
+     再垫一层白底等于给图标套了个白框，壁纸上很突兀。
+     现在图标直接落在背景 / 壁纸上，靠 drop-shadow 分离。 */
+  background: none;
+  overflow: visible;
+}
+.item .tile img { width: 54px; height: 54px; object-fit: contain; filter: drop-shadow(0 3px 6px rgba(12, 22, 44, 0.32)); }
+.item .label {
+  max-width: 100%; font-size: 11.5px; line-height: 1.32; text-align: center; color: var(--ink-2);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  word-break: normal; overflow-wrap: anywhere;
+}
+.item .badge {
+  position: absolute; top: 3px; right: 3px;
+  font-size: 9px; font-weight: 700; color: #fff;
+  padding: 1px 5px; border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 3px 8px rgba(47, 124, 255, 0.4);
+}
+
+/* 批量选择：选中项右上角小对勾 + 一圈高亮（不影响常态外观） */
+.item { position: relative; }
+.pick {
+  position: absolute; top: 4px; right: 8px;
+  width: 17px; height: 17px; border-radius: 50%;
+  display: none; place-items: center;
+  color: #fff; font-size: 11px; font-weight: 700; line-height: 1;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 2px 6px rgba(47, 124, 255, 0.36);
+  pointer-events: none;
+}
+.item.picked { background: var(--w-3); box-shadow: inset 0 0 0 1.5px var(--accent); }
+.item.picked .pick { display: grid; }
+
+/* 左右翻页小箭头（贴侧边框） */
+.nav-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 40px; height: 40px; z-index: 5;
+  display: grid; place-items: center;
+  border: 1px solid var(--edge-2); border-radius: 50%;
+  background: var(--w-1);
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-2);
+  cursor: pointer;
+  transition: opacity .22s var(--ease), transform .22s var(--spring), background .18s var(--ease);
+}
+.nav-arrow svg { width: 19px; height: 19px; fill: none; stroke: var(--ink-2); stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; }
+.nav-arrow.left { left: 8px; }
+.nav-arrow.right { right: 8px; }
+.nav-arrow:hover { background: #fff; transform: translateY(-50%) scale(1.08); }
+.nav-arrow:hover svg { stroke: var(--ink); }
+.nav-arrow.off { opacity: 0.25; pointer-events: none; }
+.nav-arrow.drop-hot { background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+.nav-arrow.drop-hot svg { stroke: #fff; }
+
+/* 底栏：页码圆点 + 正中那颗"收回"圆钮（跟桌面圆钮一条竖线上，收起时视觉是原地缩回去） */
+.foot {
+  position: relative; z-index: 6;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 2px; padding: 0 20px 8px;
+  /* 底栏只用 1px 白色分隔线，不要灰色实心分割块 */
+  border-top: 1px solid rgba(255, 255, 255, 0.45);
+}
+.dots {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  height: 42px;
+}
+.dot {
+  width: 8px; height: 8px; border-radius: 999px; border: 0; padding: 0;
+  background: rgba(118, 142, 184, 0.34);
+  cursor: pointer;
+  transition: width .3s var(--spring), background .3s var(--ease), transform .2s var(--spring);
+}
+.dot:hover { transform: scale(1.15); background: rgba(118, 142, 184, 0.55); }
+.dot.on {
+  width: 26px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 4px 12px rgba(47, 124, 255, 0.4);
+}
+.dot.drop-hot { transform: scale(1.35); background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+.dots-count { margin-left: 6px; font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+/* 底栏翻页：两只小箭头，贴在原来圆点的位置 */
+.pager {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  height: 42px;
+}
+.page-nav {
+  width: 26px; height: 26px; padding: 0;
+  display: grid; place-items: center;
+  /* 和齿轮一样的规矩：常态零底色，只有鼠标压上去才浮出那层白色圆形高亮 */
+  border: 1px solid transparent; border-radius: 50%;
+  background: transparent; color: var(--ink-3); cursor: pointer;
+  box-shadow: none;
+  transition: color .18s var(--ease), background .18s var(--ease),
+              border-color .18s var(--ease), box-shadow .18s var(--ease),
+              transform .18s var(--spring), opacity .18s var(--ease);
+}
+.page-nav svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; }
+.page-nav:hover {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.6);
+  border-color: rgba(255, 255, 255, 0.75);
+  transform: translateY(-1px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 8px 20px rgba(24, 40, 76, 0.12);
+}
+.page-nav:active { transform: scale(.94); }
+.page-nav.off { opacity: .22; pointer-events: none; }
+.page-nav.drop-hot { color: var(--accent); }
+
+/* 空页 */
+.empty {
+  position: absolute; inset: 0; z-index: 3;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  text-align: center; pointer-events: none;
+}
+.empty[hidden] { display: none; }
+.empty .pill { pointer-events: auto; margin-top: 6px; }
+.empty-art { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; margin-bottom: 4px; }
+.empty-art span {
+  width: 24px; height: 24px; border-radius: 9px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(226, 236, 252, 0.6));
+  box-shadow: inset 0 1px 0 #fff, 0 6px 14px rgba(24, 40, 76, 0.12);
+}
+.empty-art span:nth-child(2) { background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+.empty-title { font-size: 14px; font-weight: 700; color: var(--ink); }
+.empty-sub { font-size: 11.5px; color: var(--ink-3); max-width: 240px; line-height: 1.6; }
+
+/* ---------------------------------------------------------- 通用按钮 */
+.pill {
+  height: 32px; padding: 0 14px;
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--edge-2); border-radius: 999px;
+  background: var(--w-2); color: var(--ink);
+  font: inherit; font-size: 12px; font-weight: 600;
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-1);
+  cursor: pointer;
+  transition: transform .18s var(--spring), background .18s var(--ease), box-shadow .18s var(--ease), opacity .18s var(--ease);
+}
+.pill:hover { background: var(--w-1); transform: translateY(-1px); box-shadow: inset 0 1px 0 var(--hi), 0 10px 22px rgba(24, 40, 76, 0.16); }
+.pill:active { transform: scale(.96); }
+.pill.primary {
+  color: #fff; border-color: transparent;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 8px 20px rgba(47, 124, 255, 0.36);
+}
+.pill.danger { color: var(--danger); }
+.pill.ghost { background: var(--w-3); }
+.pill[disabled] { opacity: .45; pointer-events: none; }
+
+.switch {
+  width: 46px; height: 27px; padding: 3px; border: 1px solid var(--edge-2); border-radius: 999px;
+  background: rgba(120, 142, 184, 0.24);
+  cursor: pointer;
+  transition: background .24s var(--ease), border-color .24s var(--ease);
+}
+.switch span {
+  display: block; width: 19px; height: 19px; border-radius: 50%;
+  background: #fff; box-shadow: 0 2px 6px rgba(24, 40, 76, 0.24);
+  transition: transform .26s var(--spring);
+}
+.switch[aria-checked="true"] { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; }
+.switch[aria-checked="true"] span { transform: translateX(19px); }
+
+/* ---------------------------------------------------------- 设置面板 */
+.sheet-layer { position: absolute; inset: 0; z-index: 40; }
+.sheet-layer[hidden] { display: none; }
+.sheet-mask {
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, rgba(22, 32, 58, 0.05), rgba(22, 32, 58, 0.22));
+  opacity: 0; transition: opacity .24s var(--ease);
+}
+.sheet {
+  position: absolute; left: 10px; right: 10px; bottom: 10px;
+  max-height: 82%;
+  display: flex; flex-direction: column;
+  border: 1px solid var(--edge-2); border-radius: 22px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(240, 246, 255, 0.88));
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-3);
+  backdrop-filter: blur(26px) saturate(1.5);
+  -webkit-backdrop-filter: blur(26px) saturate(1.5);
+  transform: translateY(18px) scale(.98); opacity: 0;
+  transition: transform .34s var(--spring), opacity .24s var(--ease);
+}
+.sheet-layer.show .sheet-mask { opacity: 1; }
+.sheet-layer.show .sheet { transform: none; opacity: 1; }
+.sheet-grip { width: 42px; height: 4px; border-radius: 99px; background: rgba(118, 142, 184, 0.32); margin: 10px auto 4px; }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 18px 12px; border-bottom: 1px solid var(--edge-2); }
+.sheet-title { font-size: 15px; font-weight: 700; }
+.sheet-body { overflow-y: auto; padding: 6px 18px 18px; }
+.sheet-body::-webkit-scrollbar { width: 8px; }
+.sheet-body::-webkit-scrollbar-thumb { background: rgba(118, 142, 184, 0.26); border-radius: 99px; }
+.group {
+  margin: 14px 2px 6px; font-size: 11px; font-weight: 700; letter-spacing: .6px;
+  color: var(--ink-3);
+}
+.row {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  padding: 11px 12px; margin-bottom: 4px;
+  border-radius: 14px;
+  transition: background .16s var(--ease);
+}
+.row:hover { background: var(--w-2); }
+.row-label { font-size: 12.5px; color: var(--ink); }
+.row-label i { font-style: normal; font-size: 11px; color: var(--ink-3); margin-left: 6px; }
+.row.danger .row-label { color: var(--danger); }
+.row-ctl { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.row-ctl.stat { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; text-align: right; max-width: 58%; }
+
+/* 卡片边框颜色条：最左端是默认白色，往后是完整色相环（0~360°） */
+.hueslider {
+  -webkit-appearance: none; appearance: none;
+  width: 150px; height: 12px; border-radius: 99px;
+  background: linear-gradient(to right,
+    #ffffff 0%, hsl(0, 85%, 62%) 9%, hsl(40, 85%, 62%) 21%, hsl(80, 85%, 62%) 33%,
+    hsl(120, 85%, 62%) 45%, hsl(180, 85%, 62%) 58%, hsl(240, 85%, 62%) 71%,
+    hsl(300, 85%, 62%) 84%, hsl(340, 85%, 62%) 94%, hsl(360, 85%, 62%) 100%);
+  box-shadow: inset 0 0 0 1px rgba(118, 142, 184, 0.28);
+  cursor: pointer;
+  outline: none;
+}
+.hueslider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--border-preview, #ffffff);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 5px rgba(24, 40, 76, 0.3);
+}
+/* 卡片字体颜色条：左端是「默认墨色」（不是白），往后才是色相环。
+   条带用 45% 明度便于分辨颜色，滑块头仍显示真实文字色（22% 饱和 / 30% 明度）。 */
+.hueslider.ink {
+  background: linear-gradient(to right,
+    #3B3F52 0%, hsl(0, 55%, 45%) 9%, hsl(40, 55%, 45%) 21%, hsl(80, 55%, 45%) 33%,
+    hsl(120, 55%, 45%) 45%, hsl(180, 55%, 45%) 58%, hsl(240, 55%, 45%) 71%,
+    hsl(300, 55%, 45%) 84%, hsl(340, 55%, 45%) 94%, hsl(360, 55%, 45%) 100%);
+}
+.hueslider.ink::-webkit-slider-thumb {
+  background: var(--ink-preview, #3B3F52);
+}
+
+.swatches { display: flex; gap: 6px; }
+.swatch {
+  width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent;
+  cursor: pointer; padding: 0;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.6), 0 2px 6px rgba(24, 40, 76, 0.2);
+  transition: transform .18s var(--spring);
+}
+.swatch:hover { transform: scale(1.16); }
+.swatch.on { border-color: #fff; box-shadow: 0 0 0 2px var(--accent), 0 2px 6px rgba(24, 40, 76, 0.24); }
+
+/* ---------------------------------------------------------- 拖拽提示条 */
+.move-bar[hidden] { display: none !important; }
+.move-bar {
+  position: absolute; left: 50%; bottom: 104px; transform: translateX(-50%);
+  z-index: 30;
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 16px; border-radius: 999px;
+  border: 1px solid var(--edge-2);
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-2);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  font-size: 11.5px; color: var(--ink-2);
+}
+
+/* ---------------------------------------------------------- 右键菜单 */
+.ctx {
+  position: absolute; z-index: 50;
+  min-width: 178px; padding: 7px;
+  max-height: calc(100% - 16px);   /* 菜单比卡片还高时内部滚动，最后几项不会被裁掉 */
+  overflow-y: auto;
+  border: 1px solid var(--edge-2); border-radius: 16px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-3);
+  backdrop-filter: blur(24px) saturate(1.5);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  transform-origin: top left;
+  animation: ctxIn .16s var(--spring);
+}
+.ctx[hidden] { display: none; }
+@keyframes ctxIn { from { opacity: 0; transform: scale(.94) translateY(-4px); } to { opacity: 1; transform: none; } }
+.ctx-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 11px; border-radius: 10px;
+  font-size: 12.5px; color: var(--ink);
+  cursor: pointer;
+}
+.ctx-item:hover { background: var(--accent); color: #fff; }
+.ctx-item .key { font-size: 10.5px; color: var(--ink-3); }
+.ctx-item:hover .key { color: rgba(255, 255, 255, 0.8); }
+.ctx-sep { height: 1px; margin: 6px 8px; background: var(--edge-2); }
+.ctx-head { padding: 5px 11px 7px; font-size: 10.5px; color: var(--ink-3); }
+
+/* ---------------------------------------------------------- 扫描已安装软件 */
+.scan-layer { position: absolute; inset: 0; z-index: 55; display: grid; place-items: center; }
+.scan-layer[hidden] { display: none; }
+.scan-mask { position: absolute; inset: 0; background: rgba(22, 32, 58, 0.24); opacity: 0; transition: opacity .2s var(--ease); }
+.scan {
+  position: relative;
+  width: min(660px, 92%); height: min(560px, 88%);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--edge-2); border-radius: 22px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(240, 246, 255, 0.94));
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-3);
+  transform: scale(.96) translateY(10px); opacity: 0;
+  transition: transform .3s var(--spring), opacity .22s var(--ease);
+}
+.scan-layer.show .scan-mask { opacity: 1; }
+.scan-layer.show .scan { transform: none; opacity: 1; }
+.scan-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px; border-bottom: 1px solid var(--edge-2);
+}
+.scan-title { flex: 0 0 auto; font-size: 14px; font-weight: 700; }
+.scan-search {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 7px;
+  height: 32px; padding: 0 12px;
+  border: 1px solid var(--edge-2); border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  transition: background .18s var(--ease), box-shadow .18s var(--ease);
+}
+.scan-search:focus-within { background: #fff; box-shadow: 0 0 0 2px var(--accent-soft); }
+.scan-search svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: var(--ink-3); stroke-width: 2; stroke-linecap: round; }
+.scan-search input {
+  flex: 1 1 auto; min-width: 0; border: 0; outline: 0; background: none;
+  font: inherit; font-size: 12.5px; color: var(--ink);
+}
+.scan-search input::placeholder { color: var(--ink-3); }
+.scan-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px 10px 10px; }
+.scan-list::-webkit-scrollbar { width: 8px; }
+.scan-list::-webkit-scrollbar-thumb { background: rgba(118, 142, 184, 0.26); border-radius: 99px; }
+.scan-state {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  min-height: 150px; height: 100%; padding: 18px;
+  font-size: 12.5px; color: var(--ink-3); text-align: center; line-height: 1.7;
+}
+.scan-state::before {
+  content: ""; flex: 0 0 auto; width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid rgba(47, 124, 255, 0.22); border-top-color: var(--accent);
+  animation: scanSpin .8s linear infinite;
+}
+.scan-state.plain::before { display: none; }
+@keyframes scanSpin { to { transform: rotate(360deg); } }
+.scan-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 9px; margin-bottom: 2px;
+  border-radius: 13px; cursor: pointer;
+  transition: background .15s var(--ease), box-shadow .15s var(--ease);
+}
+.scan-row:hover { background: var(--w-2); }
+.scan-row.on { background: var(--accent-soft); box-shadow: inset 0 0 0 1.5px var(--accent); }
+.scan-check {
+  flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: rgba(118, 142, 184, 0.22);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  color: #fff; font-size: 11px; font-weight: 700;
+  transition: background .18s var(--ease);
+}
+.scan-check::after { content: "✓"; opacity: 0; transition: opacity .16s var(--ease); }
+.scan-row.on .scan-check { background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 2px 6px rgba(47, 124, 255, 0.35); }
+.scan-row.on .scan-check::after { opacity: 1; }
+.scan-tile { flex: 0 0 auto; width: 34px; height: 34px; display: grid; place-items: center; }
+.scan-tile img { width: 28px; height: 28px; object-fit: contain; }
+.scan-meta { flex: 1 1 auto; min-width: 0; }
+.scan-name {
+  font-size: 12.5px; color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.scan-target {
+  margin-top: 2px; font-size: 10.5px; color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.scan-one { flex: 0 0 auto; height: 26px; padding: 0 11px; font-size: 11px; }
+.scan-row.added { opacity: .6; cursor: default; }
+.scan-row.added:hover { background: none; }
+.scan-foot {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; border-top: 1px solid var(--edge-2);
+}
+.scan-sel { flex: 1 1 auto; font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+/* ---------------------------------------------------------- 卡片背景：壁纸选择 */
+.scan-list.bg-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(146px, 1fr));
+  /* 必须写 max-content：列表容器高度是确定的（flex:1 + min-height:0），
+     而 461 张卡的间距总和远超容器高度 → auto 行拿不到可用空间，
+     会一路塌到 min-content（内容 0 + 上下各 1px 边框 = 2px），整张卡只剩两条线。 */
+  grid-auto-rows: max-content;
+  gap: 10px;
+  padding: 12px 12px 14px;
+}
+.bgcard {
+  position: relative;
+  display: flex; flex-direction: column;
+  padding: 0; border: 1px solid var(--edge-2); border-radius: 14px;
+  overflow: hidden; cursor: pointer; text-align: left;
+  background: rgba(255, 255, 255, 0.6);
+  transition: transform .18s var(--spring), box-shadow .18s var(--ease), border-color .18s var(--ease);
+}
+.bgcard:hover { transform: translateY(-2px); box-shadow: 0 10px 22px rgba(24, 40, 76, 0.16); }
+.bgcard.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft), 0 10px 22px rgba(24, 40, 76, 0.16); }
+/* 用固定高度而不是 aspect-ratio：网格行高先按「无确定宽度」做一次固有尺寸计算，
+   此时 width:100% + aspect-ratio 会被算成 0 高，整张卡会塌成 2px（只剩边框）。 */
+.bgcard img { display: block; width: 100%; height: 82px; object-fit: cover; background: #e6ecf6; }
+.bgcard-name {
+  padding: 7px 9px 2px; font-size: 11.5px; color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bgcard-tag { padding: 0 9px 8px; font-size: 10px; color: var(--ink-3); }
+.bgcard.on .bgcard-name { color: var(--accent); }
+
+/* ---------------------------------------------------------- 确认框 */
+.dlg-layer { position: absolute; inset: 0; z-index: 60; display: grid; place-items: center; }
+.dlg-layer[hidden] { display: none; }
+.dlg-mask { position: absolute; inset: 0; background: rgba(22, 32, 58, 0.24); opacity: 0; transition: opacity .2s var(--ease); }
+.dlg {
+  position: relative; width: min(340px, 84%);
+  padding: 20px; border-radius: 20px;
+  border: 1px solid var(--edge-2);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-3);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  transform: scale(.94); opacity: 0;
+  transition: transform .26s var(--spring), opacity .2s var(--ease);
+}
+.dlg-layer.show .dlg-mask { opacity: 1; }
+.dlg-layer.show .dlg { transform: none; opacity: 1; }
+.dlg-title { font-size: 14.5px; font-weight: 700; margin-bottom: 8px; }
+.dlg-body { font-size: 12.5px; color: var(--ink-2); line-height: 1.6; }
+.dlg-input-wrap { margin-top: 12px; }
+.dlg-input {
+  width: 100%; height: 36px; padding: 0 12px;
+  border: 1px solid var(--edge-2); border-radius: 12px;
+  background: rgba(255, 255, 255, 0.8);
+  font: inherit; font-size: 13px; color: var(--ink); outline: 0;
+}
+.dlg-input:focus { box-shadow: 0 0 0 2px var(--accent-soft); }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+/* ---------------------------------------------------------- Toast */
+.toasts {
+  position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+  z-index: 70; display: flex; flex-direction: column; align-items: center; gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  position: relative;
+  padding: 9px 16px 9px 26px; border-radius: 999px;
+  border: 1px solid var(--edge-2);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: inset 0 1px 0 var(--hi), var(--sh-2);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  font-size: 12px; color: var(--ink);
+  animation: toastIn .3s var(--spring);
+}
+.toast::before {
+  content: ""; position: absolute; left: 13px; top: 50%; transform: translateY(-50%);
+  width: 6px; height: 6px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+.toast.warn::before { background: var(--danger); }
+.toast.out { animation: toastOut .22s var(--ease) forwards; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(10px) scale(.96); } to { opacity: 1; transform: none; } }
+@keyframes toastOut { to { opacity: 0; transform: translateY(6px) scale(.98); } }
+
+/* 首屏入场（只播一次，避免每次搜索都闪） */
+.item.enter { animation: tileIn .36s var(--spring) backwards; }
+@keyframes tileIn { from { opacity: 0; transform: translateY(10px) scale(.94); } to { opacity: 1; transform: none; } }
+
+/* ---------------------------------------------------------- 省电/降级 */
+html.simple .glass { backdrop-filter: none; -webkit-backdrop-filter: none; }
+html.simple .sheet, html.simple .ctx, html.simple .toast, html.simple .dlg, html.simple .squircle {
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+}
+.app.paused * { animation-play-state: paused !important; transition: none !important; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+/* ---- collapsed = ball only: force the whole window / panel fully transparent ---- */
+html, body { background: transparent; }
+body.collapsed { background: transparent !important; }
+body.collapsed #app {
+  background: none !important;
+  box-shadow: none !important;
+  border: 0 !important;
+  outline: 0 !important;
+}
+body.collapsed .glass, body.collapsed .frost, body.collapsed .cardbg { display: none !important; }
+
+/* 小浮层不叠模糊：它们背后就是卡片自己的玻璃，再糊一层只是白烧 GPU。
+   注意 .glass 必须排除在外 —— 它是毛玻璃本体，被 !important 关掉就前功尽弃。 */
+.sheet, .ctx, .toast, .dlg {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+

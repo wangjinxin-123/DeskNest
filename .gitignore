@@ -1,0 +1,9 @@
+# 依赖与打包产物（体积大 / 可重新安装或生成）
+node_modules/
+artifacts/
+uninstall-backup/
+DeskNest.exe
+
+# 本地配置与日志
+desknest-config.json
+*.log
