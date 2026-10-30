@@ -9,6 +9,18 @@
 
 ---
 
+## 0. 当前版本行为（1.0.0）
+
+> 下文 §1–§7 是 v3 时期（2026-10 之前）的实现记录，行为已变；以本节为准。
+
+- **首次启动卡片是空的**：只有一条「使用说明」（便携包里的 `使用说明.txt`），没有任何预置软件；
+- **桌面图标不会自动收纳**：启动只做“减法”（删掉已经不存在的条目、收拾空页），要进卡片必须手动添加 —— 设置 → 应用 →「添加应用」，或在「扫描」里勾选已装软件；
+- **背景透明度默认 80%**：滑条语义是「透明度」（100% = 完全透出桌面、0% = 完全不透），CSS 的 `--glass-opacity` 是「不透明度」，换算成 `(100 - t) / 100`；
+- **首次启动会弹一次引导**：可一键创建桌面快捷方式、开启开机自启，两者以后都能在设置里改；
+- **便携包结构**：`DeskNest.exe`（启动器）+ `DeskNest-core.exe`（Electron 引擎，即改名后的 electron.exe）+ 同级 `resources\app\`；`resources\app\tools\*.ps1` 是运行期依赖（图标提取、应用扫描、壁纸抓取），打包时**不能漏**。
+
+---
+
 ## 1. 目录结构
 
 ```
@@ -147,9 +159,9 @@ launch.vbs                 ← 静默启动器（无控制台窗口，且会清�
 
 | 功能 | 说明 |
 | --- | --- |
-| 自动扫描 | 启动扫描「当前用户桌面 + 公共桌面」，识别 `.lnk / .url / .exe / .appref-ms` 与桌面文件夹；同名以用户桌面优先 |
+| 桌面扫描 | 只在你点「设置 → 应用 → 重新扫描桌面」时扫描「当前用户桌面 + 公共桌面」，识别 `.lnk / .url / .exe / .appref-ms` 与桌面文件夹；启动时**不会**把桌面图标自动收进卡片 |
 | 真实图标 | Shell 图像列表 256×256（jumbo）真图标：解析 `.lnk` 的 `IconLocation`/目标路径、`.url` 的 `IconFile`，导出 PNG 到 `iconcache/`；失败才回退 `app.getFileIcon`（见第 4 节） |
-| 智能分类 | 关键词打分归入 编程开发 / 桌面文件夹 / 办公学习 / 社交通讯 / 影音娱乐 / 游戏 / 设计创作 / 浏览器 / 系统工具 / 其他 → **直接就是前 10 页**（第 1 页=编程开发，第 2 页=桌面文件夹）；你可以随便改名、加页、搬图标 |
+| 智能分类 | 手动「添加应用」时按关键词打分归入 编程开发 / 桌面文件夹 / 办公学习 / 社交通讯 / 影音娱乐 / 游戏 / 设计创作 / 浏览器 / 系统工具 / 其他（有对应页就追加，没有就新建一页）；页名可改、可加页、可搬图标 |
 | 右键菜单 | 图标：打开 / 在资源管理器中定位 / 复制完整路径 / 移到「某页」/ 从本页移除；空白处：新建页面 / 重命名 / 添加应用 / 设置；收起的文件夹上：打开 / 添加应用 / 重扫 / 隐藏桌面图标 / 退出 |
 | 双击启动 | 双击启动程序、打开文件夹、打开 `.url` 网址（`.url` 走 `openExternal`） |
 | 搜索 | 顶栏搜索框实时筛选（110ms 去抖），结果显示为单张「搜索结果」页，清空即回到分页；`Ctrl+F` 聚焦，`Esc` 清空 |
@@ -299,7 +311,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\idle-measure.ps1 -Minu
 侧边框右箭头翻到第 2 页（`translateX` 位移 + 页面名切换）、设置抽屉 13 行 + 8 色色板、
 搜索过滤（标题变「搜索结果」）、收起回圆钮（窗口回到 144×144）。
 
-### 验收清单与本机证据（全部实跑过）
+### 验收清单与本机证据（v3 时期实跑）
+
+> 下表是 v3 时期（启动会自动收纳桌面项目）的断言与证据；1.0.0 起默认卡片只有一页一条「使用说明」，
+> 相应断言（如 `pages=10 / tiles=64`）需要按新行为调整，`tools/shot-v4.js` 也基于旧行为。
 
 | 验收项 | 结果 | 证据 |
 | --- | --- | --- |
@@ -344,7 +359,9 @@ UI 代码几乎可以照搬本项目的 `index.html/styles.css/renderer.js`（�
 
 ---
 
-## 7. 实测数据（本机：Windows 11，16 逻辑核心，64 个桌面项目 → 10 个分类文件夹）
+## 7. 实测数据（v3 时期本机：Windows 11，16 逻辑核心，64 个桌面项目 → 10 个分类文件夹）
+
+> 1.0.0 起不再自动收纳桌面图标，以下数字仅作历史参考。
 
 启动耗时（`NEST_TIMING=1` 打点，从主进程加载到首帧）：
 
@@ -421,28 +438,7 @@ collapse {"x":817,"y":798,"w":144,"h":144}   ← 连续 expand/collapse 3 轮零
 
 ---
 
-## 8. 交接记录：清掉两个遗留桌面插件（本机真实执行）
-
-用户在桌面用 **Rainmeter**（桌面小部件）+ **Winstep Nexus**（停靠栏/水印插件）时，两者与 DeskNest 的定位重复。
-按"卸载干净"执行并留了回滚：
-
-| 项目 | 结果 |
-| --- | --- |
-| Rainmeter 4.5.26 | 进程停止 → 官方卸载器 `C:\Program Files\Rainmeter\uninst.exe /S`（退出码 0）→ 残留 `C:\Program Files\Rainmeter`、`HKLM\SOFTWARE\WOW6432Node\Rainmeter`、卸载注册表项、`%APPDATA%\Rainmeter`、启动项 `Startup\Rainmeter.lnk` **全部清除** |
-| Winstep Nexus（Xtreme） | 进程停止 → 官方卸载器 `D:\nexus\Winstep\unins000.exe /SILENT` → 注册表项与 `HKLM\Software\WOW6432Node` 子键清除 → 残留目录 `D:\nexus`（含 Nexus.exe/unins000.* 等 19MB）与 `NexusSetup.exe`、桌面 `Nexus.lnk`、HKCU Run 里的 `Nexus` 自启项 **全部清除** |
-| 释放空间 | 约 **81MB**（Rainmeter 7.2MB + Winstep 73.6MB，另外还有残留 19MB 一并删掉） |
-| 未动的东西 | Wallpaper Engine（在跑动态壁纸，属另一类需求）、OneDrive/百度网盘/夸克/火绒/Everything 等自启项一律没碰 |
-| 回滚材料 | `uninstall-backup\<时间戳>\`：`Rainmeter-AppData.zip`（整套配置与 Layouts）、`winstep-config\`（配置文件）、`registry\*.reg`（卸载注册表项导出） |
-
-执行脚本：`tools/uninstall-legacy.ps1`（**需管理员**，会用一次 UAC；日志和结果 JSON 落在 `%TEMP%`）。
-因为 `C:\Program Files` 与 HKLM 都需要提权，这一步只能由用户点一次"是"；其余全部由非提权会话完成。
-
-验收：`Get-Process Rainmeter,Nexus` = 0；`D:\nexus`、`C:\Program Files\Rainmeter`、`%APPDATA%\Rainmeter` 均不存在；
-`node tools/verify-clean.js` → `legacy_left = []`、`own_shortcut = ["DeskNest"]`、收纳库 64 项 / 10 个文件夹。
-
----
-
-## 9. 已知边界与未覆盖项
+## 8. 已知边界与未覆盖项
 
 1. **`.lnk` 目标未解析**：为了扫描速度与零 COM 调用，快捷方式只取 Shell 图标并按文件名分类，
    未解析真实目标路径（启动走的仍是 `shell.openPath`，不影响使用）。
